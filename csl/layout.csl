@@ -1,0 +1,164 @@
+// Copyright 2025 Cerebras Systems.
+// Modifications copyright 2026 Yu Gao.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Derived from Cerebras csl-examples tutorials/gemv-08-routes-3, modified to
+// lay out a two-tile GEMV chain (gemv1 | gemv2) with an int8 y1 handoff
+// between the tiles.
+
+// kernel dimensions
+param kernel_x_dim: i16;
+param kernel_y_dim: i16;
+
+// total matrix dimensions
+param M: i16;
+param N: i16;
+
+// gemv1 (left tile) colors
+const x_color:     color = @get_color(0);
+const ax_color_1:  color = @get_color(1);
+const ax_color_2:  color = @get_color(2);
+
+// gemv2 (right tile) colors
+const y1_color:    color = @get_color(3);
+const ay_color_1:  color = @get_color(4);
+const ay_color_2:  color = @get_color(5);
+
+// This example uses 2*kernel_x_dim x kernel_y_dim PEs.
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width = 2 * kernel_x_dim,
+  .height = kernel_y_dim
+});
+
+layout {
+  // PE coordinates are (column, row).
+  @set_rectangle(2 * kernel_x_dim, kernel_y_dim);
+
+  // The two-GEMV chain requires square A1/A2, split evenly across both tiles.
+  @comptime_assert(M == N);
+  @comptime_assert(M % kernel_y_dim == 0);
+  @comptime_assert(N % kernel_x_dim == 0);
+
+  for (@range(i16, 2 * kernel_x_dim)) |gx| {
+    for (@range(i16, kernel_y_dim)) |pe_y| {
+      const is_gemv1 = gx < kernel_x_dim;
+      const tile_kind: u16 = if (is_gemv1) 0 else 1;
+      const lx = if (is_gemv1) gx else gx - kernel_x_dim;
+
+      // Gemv2 is rotated: rows split over local x, columns over pe_y.
+      const mpp = if (is_gemv1) M / kernel_y_dim else N / kernel_x_dim;
+      const npp = if (is_gemv1) N / kernel_x_dim else N / kernel_y_dim;
+
+      const send_reduce = if (is_gemv1) ax_color_1 else ay_color_1;
+      const recv_reduce = if (is_gemv1) ax_color_2 else ay_color_2;
+      const checker_idx = if (is_gemv1) lx else pe_y;
+
+      const bcast_send = if (is_gemv1) x_color else y1_color;
+      const bcast_recv = if (is_gemv1) x_color else y1_color;
+
+      if (checker_idx % 2 == 0) {
+        @set_tile_code(gx, pe_y, "pe_program.csl", .{
+          .memcpy_params = memcpy.get_params(gx),
+          .M_per_PE = mpp,
+          .N_per_PE = npp,
+          .kernel_x_dim = kernel_x_dim,
+          .kernel_y_dim = kernel_y_dim,
+          .tile_kind = tile_kind,
+          .broadcast_color = bcast_send,
+          .recv_broadcast_color = bcast_recv,
+          .send_y1_color = y1_color,
+          .send_reduce_color = send_reduce,
+          .recv_reduce_color = recv_reduce,
+        });
+      } else {
+        @set_tile_code(gx, pe_y, "pe_program.csl", .{
+          .memcpy_params = memcpy.get_params(gx),
+          .M_per_PE = mpp,
+          .N_per_PE = npp,
+          .kernel_x_dim = kernel_x_dim,
+          .kernel_y_dim = kernel_y_dim,
+          .tile_kind = tile_kind,
+          .broadcast_color = bcast_send,
+          .recv_broadcast_color = bcast_recv,
+          .send_y1_color = y1_color,
+          .send_reduce_color = recv_reduce,
+          .recv_reduce_color = send_reduce,
+        });
+      }
+    }
+  }
+
+  // Create route values.
+  const RX_R_TX_RS = .{ .rx = .{RAMP},  .tx = .{RAMP, SOUTH} };
+  const RX_N_TX_RS = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} };
+  const RX_N_TX_R  = .{ .rx = .{NORTH}, .tx = .{RAMP} };
+  const RX_W_TX_R  = .{ .rx = .{WEST},  .tx = .{RAMP} };
+  const RX_R_TX_E  = .{ .rx = .{RAMP},  .tx = .{EAST} };
+  const RX_W_TX_RE = .{ .rx = .{WEST},  .tx = .{RAMP, EAST} };
+  const RX_R_TX_S  = .{ .rx = .{RAMP},  .tx = .{SOUTH} };
+  const RX_N_TX_R2 = .{ .rx = .{NORTH}, .tx = .{RAMP} };
+
+  for (@range(i16, 2 * kernel_x_dim)) |gx| {
+    for (@range(i16, kernel_y_dim)) |pe_y| {
+      const is_gemv1 = gx < kernel_x_dim;
+      const lx = if (is_gemv1) gx else gx - kernel_x_dim;
+
+      if (is_gemv1) {
+        // Gemv1 broadcasts x north-to-south.
+        if (pe_y == 0) {
+          @set_color_config(gx, pe_y, x_color, .{ .routes = RX_R_TX_RS });
+        } else if (pe_y == kernel_y_dim - 1) {
+          @set_color_config(gx, pe_y, x_color, .{ .routes = RX_N_TX_R });
+        } else {
+          @set_color_config(gx, pe_y, x_color, .{ .routes = RX_N_TX_RS });
+        }
+
+        // Gemv1 reduces partial y eastward.
+        if (lx % 2 == 0) {
+          @set_color_config(gx, pe_y, ax_color_1, .{ .routes = RX_R_TX_E });
+          @set_color_config(gx, pe_y, ax_color_2, .{ .routes = RX_W_TX_R });
+        } else {
+          @set_color_config(gx, pe_y, ax_color_1, .{ .routes = RX_W_TX_R });
+          @set_color_config(gx, pe_y, ax_color_2, .{ .routes = RX_R_TX_E });
+        }
+
+        // Gemv1 right column hands final y1 chunks to gemv2 on the same row.
+        if (lx == kernel_x_dim - 1) {
+          @set_color_config(gx, pe_y, y1_color, .{ .routes = RX_R_TX_E });
+        }
+      } else {
+        // Gemv2 broadcasts y1 west-to-east.
+        if (lx == kernel_x_dim - 1) {
+          @set_color_config(gx, pe_y, y1_color, .{ .routes = RX_W_TX_R });
+        } else {
+          @set_color_config(gx, pe_y, y1_color, .{ .routes = RX_W_TX_RE });
+        }
+
+        // Gemv2 reduces partial y2 north-to-south.
+        const ay_send = if (pe_y % 2 == 0) ay_color_1 else ay_color_2;
+        const ay_recv = if (pe_y % 2 == 0) ay_color_2 else ay_color_1;
+        @set_color_config(gx, pe_y, ay_send, .{ .routes = RX_R_TX_S });
+        @set_color_config(gx, pe_y, ay_recv, .{ .routes = RX_N_TX_R2 });
+      }
+    }
+  }
+
+  // export symbol names
+  @export_name("A", [*]f16, true);
+  @export_name("x", [*]f16, true);
+  @export_name("y", [*]f16, true);
+  @export_name("tsc_start", [*]u16, true);
+  @export_name("tsc_end", [*]u16, true);
+  @export_name("compute", fn()void);
+}

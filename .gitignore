@@ -1,0 +1,15 @@
+# cslc build outputs
+out/
+out_smoke/
+
+# Simulator outputs (written to the working directory)
+sim.log
+sim_stats.json
+simconfig.json
+simfab_traces/
+
+# Python
+__pycache__/
+
+# macOS
+.DS_Store

@@ -1,0 +1,505 @@
+// Copyright 2025 Cerebras Systems.
+// Modifications copyright 2026 Yu Gao.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Derived from Cerebras csl-examples tutorials/gemv-08-routes-3, modified to
+// run both GEMV tiles, quantize the y1 handoff to int8, and record on-chip TSC
+// timestamps.
+
+param memcpy_params;
+
+// Matrix dimensions
+param M_per_PE: i16;
+param N_per_PE: i16;
+
+// Program rectangle dimensions
+param kernel_x_dim: u16;
+param kernel_y_dim: u16;
+
+// Tile kind: 0 = gemv1 (broadcast NS, reduce EW), 1 = gemv2 (broadcast EW, reduce NS)
+param tile_kind: u16;
+
+// --- Fabric colors ---------------------------------------------------------
+param send_reduce_color:     color; // sends partial y along the reduce axis (fp16)
+param recv_reduce_color:     color; // recvs partial y along the reduce axis (fp16)
+param broadcast_color:       color; // color this PE *sends* on for the activation broadcast
+param recv_broadcast_color:  color; // color this PE *drains* its activation packet on
+param send_y1_color:         color; // gemv1 right-col y1 handoff east; unused elsewhere
+
+// --- Queue bindings (each queue binds to exactly one color) -----------------
+const send_reduce_oq:    output_queue = @get_output_queue(2); // partial y out along reduce axis
+const recv_reduce_iq:    input_queue  = @get_input_queue(3);  // partial y in along reduce axis
+const broadcast_send_oq: output_queue = @get_output_queue(4); // activation packet out (or unused)
+const broadcast_recv_iq: input_queue  = @get_input_queue(5);  // activation packet drained here (x / y1)
+const send_y1_oq:        output_queue = @get_output_queue(6); // y1 packet handoff east
+
+// --- Task IDs ---------------------------------------------------------------
+const exit_task_id:           local_task_id = @get_local_task_id(9);  // release host cmd stream
+const reduce_task_id:         local_task_id = @get_local_task_id(10); // start/continue reduce chain
+const send_y1_task_id:        local_task_id = @get_local_task_id(11); // gemv1 right-col y1 handoff
+const after_reduce_task_id:   local_task_id = @get_local_task_id(12); // post-reduce routing
+const gemv_task_id:           local_task_id = @get_local_task_id(13); // dequant + GEMV once packet arrives
+const stamp_and_exit_task_id: local_task_id = @get_local_task_id(14); // stamp t1, then exit
+
+// --- Imported modules -------------------------------------------------------
+// memcpy module provides infrastructure for copying data and launching functions.
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// layout module provides PE coordinates at runtime.
+const layout_mod = @import_module("<layout>");
+
+// TSC cycle counter for on-chip kernel-latency timing (excludes H2D/D2H).
+const tsc = @import_module("<time>");
+
+const prt = @import_module("<simprint>");
+const ENABLE_PROBE: bool = false; // true: emit simprint PROBE markers (tools/parse_breakdown.py)
+
+// --- PE-local buffers and DSDs ----------------------------------------------
+// A, x, y are f16. A is stored column-major per PE.
+var A: [M_per_PE * N_per_PE]f16;
+var x: [N_per_PE]f16;
+var y: [M_per_PE]f16;
+
+var A_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = M_per_PE });
+var y_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y, .extent = M_per_PE });
+const x_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &x, .extent = N_per_PE });
+
+
+var absmax_buf: [M_per_PE]f16;
+const absmax_y_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &absmax_buf, .extent = M_per_PE });
+
+
+const RECV_LANE_WORDS: i16 = (N_per_PE + 3) / 4;
+const RECV_PACKET_WORDS: i16 = RECV_LANE_WORDS + 1;
+const Y1_LANE_WORDS: i16 = (M_per_PE + 3) / 4;
+const Y1_PACKET_WORDS: i16 = Y1_LANE_WORDS + 1;
+
+const act_scale_word = packed struct { scale: f16, pad: u16 };
+const act_lanes_word = packed struct { c0: i8, c1: i8, c2: i8, c3: i8 };
+const act_packet_word = packed union {
+  scale_word: act_scale_word,
+  lanes_word: act_lanes_word,
+  raw: u32,
+};
+
+var x_recv: [N_per_PE]f16;
+
+// gemv2 drains its int8 y1 packet here, then dequantizes in gemv().
+var act_recv_buf: [RECV_PACKET_WORDS]u32;
+// gemv1 reduce-end PE quantizes its final y1 chunk here before the east handoff.
+var y1_send_buf: [Y1_PACKET_WORDS]u32;
+
+const x_recv_dsd      = @get_dsd(mem1d_dsd, .{ .base_address = &x_recv,      .extent = N_per_PE });
+const act_recv_buf_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &act_recv_buf, .extent = RECV_PACKET_WORDS });
+const y1_send_buf_dsd  = @get_dsd(mem1d_dsd, .{ .base_address = &y1_send_buf,  .extent = Y1_PACKET_WORDS });
+
+const Y1_FULL_WORDS: i16 = M_per_PE / 4;
+const Y1_TAIL: i16 = M_per_PE - Y1_FULL_WORDS * 4;
+
+const y0_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |w|{Y1_FULL_WORDS} -> y[4 * w + 0] });
+const y1_lane_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |w|{Y1_FULL_WORDS} -> y[4 * w + 1] });
+const y2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |w|{Y1_FULL_WORDS} -> y[4 * w + 2] });
+const y3_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |w|{Y1_FULL_WORDS} -> y[4 * w + 3] });
+const y1_lanes_out_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |w|{Y1_FULL_WORDS} -> y1_send_buf[w + 1] });
+
+
+var A_ptr: [*]f16 = &A;
+var x_ptr: [*]f16 = &x;
+var y_ptr: [*]f16 = &y;
+
+// On-chip kernel-latency timestamps: t0 stamped at the start of compute(),
+// t1 in stamp_and_exit after terminal work completes. Exported as raw u16 words.
+var tsc_start = @zeros([tsc.tsc_size_words]u16);
+var tsc_end   = @zeros([tsc.tsc_size_words]u16);
+var tsc_start_ptr: [*]u16 = &tsc_start;
+var tsc_end_ptr:   [*]u16 = &tsc_end;
+
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+// --- Tile-kind edge helpers (broadcast source / reduce start / reduce end) --
+// Local column index within this tile's gemv rectangle.
+fn local_x() u16 {
+  const gx: u16 = layout_mod.get_x_coord();
+  if (tile_kind == 0) { // GEMV1
+    return gx;
+  } else {              // GEMV2
+    return gx - kernel_x_dim;
+  }
+}
+
+// True only at the top of gemv1, which launches the x broadcast.
+fn is_broadcast_source() bool {
+  if (tile_kind == 0) { // GEMV1
+    return layout_mod.get_y_coord() == 0;
+  } else {
+    // gemv2's broadcast source is gemv1's right col, external to this tile.
+    return false;
+  }
+}
+
+// gemv1 reduces eastward (start at left col); gemv2 reduces southward (start at top row).
+fn is_reduce_start() bool {
+  if (tile_kind == 0) {
+    return local_x() == 0;
+  } else {
+    return layout_mod.get_y_coord() == 0;
+  }
+}
+
+// gemv1 reduce ends at the right col; gemv2 reduce ends at the bottom row.
+fn is_reduce_end() bool {
+  if (tile_kind == 0) {
+    return local_x() == kernel_x_dim - 1;
+  } else {
+    return layout_mod.get_y_coord() == kernel_y_dim - 1;
+  }
+}
+
+
+// One representative PE per tile prints the PROBE phase markers.
+fn is_probe() bool {
+  if (tile_kind == 0) {
+    // gemv1 top-right PE: broadcast source (top row) and reduce end (packs y1).
+    return is_reduce_end() and layout_mod.get_y_coord() == 0;
+  } else {
+    // gemv2 top-left PE: reduce start.
+    return is_reduce_start() and local_x() == 0;
+  }
+}
+
+
+fn probe_mark(event: u16) void {
+  if (ENABLE_PROBE and is_probe()) {
+    prt.print_string("PROBE t"); prt.print_u16_decimal(tile_kind);
+    prt.print_string(" e");      prt.print_u16_decimal(event);
+    prt.print_string("\n"); // newline flushes the line to sim.log
+  }
+}
+
+
+fn is_col_probe() bool {
+  if (tile_kind != 0) { return false; }
+  if (local_x() != kernel_x_dim - 1) { return false; }
+  const yy: u16 = layout_mod.get_y_coord();
+  return yy == 1 or yy == 2;
+}
+
+fn col_mark() void {
+  if (ENABLE_PROBE and is_col_probe()) {
+    prt.print_string("PROBE col y"); prt.print_u16_decimal(layout_mod.get_y_coord());
+    prt.print_string("\n");
+  }
+}
+
+
+fn is_mid_probe() bool {
+  if (tile_kind != 0) { return false; }
+  if (layout_mod.get_y_coord() != 1) { return false; }
+  // i16 arithmetic so kernel_x_dim-3 doesn't underflow u16 when kx < 3 (smoke).
+  const lx: i16 = @as(i16, local_x());
+  const kx: i16 = @as(i16, kernel_x_dim);
+  return lx == kx - 2 or lx == kx - 3;
+}
+
+fn mid_mark(tag: u16) void {
+  if (ENABLE_PROBE and is_mid_probe()) {
+    prt.print_string("PROBE mid x"); prt.print_u16_decimal(local_x());
+    prt.print_string(" e");          prt.print_u16_decimal(tag);
+    prt.print_string("\n");
+  }
+}
+
+// --- Symmetric int8 quantize helpers (mirror int8_utils) --------------------
+fn round_to_i16(v: f16) i16 {
+  if (v >= @as(f16, 0.0)) {
+    return @as(i16, v + @as(f16, 0.5));
+  }
+  return @as(i16, v - @as(f16, 0.5));
+}
+
+fn clamp_i16_to_i8_range(v: i16) i8 {
+  if (v > 127) { return @as(i8, 127); }
+  if (v < -127) { return @as(i8, -127); }
+  return @as(i8, v);
+}
+
+
+const INV_127: f16 = @as(f16, 0.007874015748);
+
+fn quant_pack4(v0: f16, v1: f16, v2: f16, v3: f16, inv_scale: f16) u32 {
+  const lanes = act_lanes_word {
+    .c0 = clamp_i16_to_i8_range(round_to_i16(v0 * inv_scale)),
+    .c1 = clamp_i16_to_i8_range(round_to_i16(v1 * inv_scale)),
+    .c2 = clamp_i16_to_i8_range(round_to_i16(v2 * inv_scale)),
+    .c3 = clamp_i16_to_i8_range(round_to_i16(v3 * inv_scale)),
+  };
+  const word = act_packet_word { .lanes_word = lanes };
+  return word.raw;
+}
+
+// Quantize the final y1 chunk (M_per_PE, in y) into y1_send_buf.
+fn pack_y1_packet() void {
+
+  // Find the max absolute value
+  @fabsh(absmax_y_dsd, y_dsd);
+  probe_mark(15);
+
+  var absmax: f16 = @as(f16, 0.0);
+  var cur: i16 = M_per_PE;
+  while (cur > 1) {
+    const half: i16 = cur / 2;
+    var lo = @get_dsd(mem1d_dsd, .{ .base_address = &absmax_buf, .extent = @as(u16, half) });
+    var hi = @get_dsd(mem1d_dsd, .{ .base_address = &absmax_buf, .extent = @as(u16, half) });
+    hi = @increment_dsd_offset(hi, half, f16);
+    @fmaxh(lo, lo, hi);
+    if (half * 2 != cur) {
+      const last: f16 = absmax_buf[cur - 1];
+      if (last > absmax_buf[0]) { absmax_buf[0] = last; }
+    }
+    cur = half;
+  }
+  absmax = absmax_buf[0];
+  probe_mark(16);
+  const scale: f16 = if (absmax == @as(f16, 0.0)) @as(f16, 1.0) else absmax * INV_127;
+  const inv_scale: f16 = if (absmax == @as(f16, 0.0)) @as(f16, 0.0) else @as(f16, 127.0) / absmax;
+
+  const scale_word = act_packet_word { .scale_word = act_scale_word { .scale = scale, .pad = 0 } };
+  y1_send_buf[0] = scale_word.raw;
+
+  probe_mark(10); // PACKY_mid: absmax+scale done, quant+pack (@map) begins
+
+  // Full 4-lane words via one @map; scalar tail for the rest.
+  if (Y1_FULL_WORDS > 0) {
+    @map(quant_pack4, y0_dsd, y1_lane_dsd, y2_dsd, y3_dsd, inv_scale, y1_lanes_out_dsd);
+  }
+
+  if (Y1_TAIL != 0) {
+    const base: i16 = Y1_FULL_WORDS * 4;
+    var lanes = act_lanes_word { .c0 = 0, .c1 = 0, .c2 = 0, .c3 = 0 };
+    if (Y1_TAIL >= 1) { lanes.c0 = clamp_i16_to_i8_range(round_to_i16(y[base + 0] * inv_scale)); }
+    if (Y1_TAIL >= 2) { lanes.c1 = clamp_i16_to_i8_range(round_to_i16(y[base + 1] * inv_scale)); }
+    if (Y1_TAIL >= 3) { lanes.c2 = clamp_i16_to_i8_range(round_to_i16(y[base + 2] * inv_scale)); }
+    const lanes_word = act_packet_word { .lanes_word = lanes };
+    y1_send_buf[Y1_FULL_WORDS + 1] = lanes_word.raw;
+  }
+}
+
+
+fn compute() void {
+  // t0: common launch instant for every PE, before any on-chip work.
+  tsc.enable_tsc();
+  tsc.get_timestamp(&tsc_start);
+
+  // START marker, then 3 back-to-back CAL markers to calibrate print cost.
+  probe_mark(0);
+  probe_mark(1);
+  probe_mark(1);
+  probe_mark(1);
+
+  if (tile_kind == 0) {
+    // gemv1: fp16 x, bulk @fmovh with simd_max (two f16 per 32-bit wavelet).
+    const recv_dsd = @get_dsd(fabin_dsd, .{
+      .extent = N_per_PE,
+      .input_queue = broadcast_recv_iq,
+      .simd_mode = .{ .simd_max = true },
+    });
+    @fmovh(x_recv_dsd, recv_dsd, .{ .async = true, .activate = gemv_task_id });
+  } else {
+    // gemv2: int8 y1 packet, raw u32 wavelets via @mov32.
+    const recv_dsd = @get_dsd(fabin_dsd, .{
+      .extent = RECV_PACKET_WORDS,
+      .input_queue = broadcast_recv_iq,
+    });
+    @mov32(act_recv_buf_dsd, recv_dsd, .{ .async = true, .activate = gemv_task_id });
+  }
+
+  // gemv1 top row: broadcast the fp16 x slice south in bulk. The router fans it
+  // out south and loops a copy back to this PE's own drain (into x_recv). x_recv
+  // is separate from x so the send (from x) and the loopback drain don't race.
+  if (is_broadcast_source()) {
+    const send_dsd = @get_dsd(fabout_dsd, .{
+      .extent = N_per_PE,
+      .output_queue = broadcast_send_oq,
+      .simd_mode = .{ .simd_max = true },
+    });
+    @fmovh(send_dsd, x_dsd, .{ .async = true });
+  }
+}
+
+
+// ============================================================================
+// Tasks (in execution order)
+// ============================================================================
+
+task gemv() void {
+  probe_mark(5); // GEMV_in: slice drained, accumulate begins
+  col_mark();    // x-arrival on gemv1 rightmost-col rows 1,2 (per-hop NS latency)
+  mid_mark(0);   // interior PE (kx-2,1) recv: data in, work begins
+  if (tile_kind == 0) {
+
+    var j: i16 = 0;
+    while (j + 4 <= N_per_PE) {
+      @fmach(y_dsd, y_dsd, A_dsd, x_recv[j + 0]);
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      @fmach(y_dsd, y_dsd, A_dsd, x_recv[j + 1]);
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      @fmach(y_dsd, y_dsd, A_dsd, x_recv[j + 2]);
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      @fmach(y_dsd, y_dsd, A_dsd, x_recv[j + 3]);
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      j += 4;
+    }
+    while (j < N_per_PE) {
+      @fmach(y_dsd, y_dsd, A_dsd, x_recv[j]);
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      j += 1;
+    }
+    @activate(reduce_task_id);
+    return;
+  }
+
+  // gemv2: int8 y1 packet -> accumulate codes, then one @fmulh by the slice scale.
+  const scale_view = act_packet_word { .raw = act_recv_buf[0] };
+  const scale: f16 = scale_view.scale_word.scale;
+  if (N_per_PE % 4 == 0) {
+    // fast path: every lane word is full, accumulate all 4 codes unguarded.
+    for (@range(i16, RECV_LANE_WORDS)) |w| {
+      const lanes_view = act_packet_word { .raw = act_recv_buf[w + 1] };
+      const lanes: act_lanes_word = lanes_view.lanes_word;
+      @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c0));
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c1));
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c2));
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c3));
+      A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+    }
+  } else {
+    // tail-safe path: last word may hold fewer than 4 valid codes.
+    for (@range(i16, RECV_LANE_WORDS)) |w| {
+      const base: i16 = w * 4;
+      const lanes_view = act_packet_word { .raw = act_recv_buf[w + 1] };
+      const lanes: act_lanes_word = lanes_view.lanes_word;
+      if (base + 0 < N_per_PE) {
+        @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c0));
+        A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      }
+      if (base + 1 < N_per_PE) {
+        @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c1));
+        A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      }
+      if (base + 2 < N_per_PE) {
+        @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c2));
+        A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      }
+      if (base + 3 < N_per_PE) {
+        @fmach(y_dsd, y_dsd, A_dsd, @as(f16, lanes.c3));
+        A_dsd = @increment_dsd_offset(A_dsd, M_per_PE, f16);
+      }
+    }
+  }
+  probe_mark(6); // DEQ_in: accumulate done, dequant (@fmulh scale) begins
+  @fmulh(y_dsd, y_dsd, scale);
+  probe_mark(7); // DEQ_out: dequant done
+  @activate(reduce_task_id);
+}
+
+
+task reduce() void {
+  probe_mark(8); // RED_in: compute done, start of the send phase
+  const out_dsd = @get_dsd(fabout_dsd, .{
+    .extent = M_per_PE,
+    .output_queue = send_reduce_oq,
+    .simd_mode = .{ .simd_max = true },
+  });
+  const in_dsd = @get_dsd(fabin_dsd, .{
+    .extent = M_per_PE,
+    .input_queue = recv_reduce_iq,
+    .simd_mode = .{ .simd_max = true },
+  });
+
+  if (is_reduce_start() and is_reduce_end()) {
+    @activate(after_reduce_task_id);
+  } else if (is_reduce_start()) {
+    @fmovh(out_dsd, y_dsd, .{ .async = true, .activate = stamp_and_exit_task_id });
+  } else if (is_reduce_end()) {
+    @faddh(y_dsd, y_dsd, in_dsd, .{ .async = true, .activate = after_reduce_task_id });
+  } else {
+    @faddh(out_dsd, y_dsd, in_dsd, .{ .async = true, .activate = stamp_and_exit_task_id });
+  }
+}
+
+
+task after_reduce() void {
+  if (tile_kind == 0 and is_reduce_end()) {
+    @activate(send_y1_task_id);
+  } else {
+    @activate(stamp_and_exit_task_id);
+  }
+}
+
+
+task send_y1() void {
+  probe_mark(9); // PACKY_in: E reduce done, quant+pack y1 begins
+  pack_y1_packet();
+  probe_mark(11); // PACKY_out: quant+pack y1 done, handoff @mov32 begins
+  const send_dsd = @get_dsd(fabout_dsd, .{
+    .extent = Y1_PACKET_WORDS,
+    .output_queue = send_y1_oq,
+  });
+  @mov32(send_dsd, y1_send_buf_dsd, .{ .async = true, .activate = stamp_and_exit_task_id });
+}
+
+
+task stamp_and_exit() void {
+  probe_mark(12); // END: terminal work (send y1 / final y2 reduce) complete
+  mid_mark(1);    // interior PE (kx-2,1) exit: work done, leaving
+  tsc.get_timestamp(&tsc_end);
+  @activate(exit_task_id);
+}
+
+// exit_task: release the host command stream once the kernel finishes.
+task exit_task() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+
+// ============================================================================
+// Task bindings, queue init, and exported symbols
+// ============================================================================
+comptime {
+  @bind_local_task(exit_task, exit_task_id);
+  @bind_local_task(stamp_and_exit, stamp_and_exit_task_id);
+  @bind_local_task(after_reduce, after_reduce_task_id);
+  @bind_local_task(reduce, reduce_task_id);
+  @bind_local_task(send_y1, send_y1_task_id);
+  @bind_local_task(gemv, gemv_task_id);
+
+  @initialize_queue(send_reduce_oq,    .{ .color = send_reduce_color });
+  @initialize_queue(recv_reduce_iq,    .{ .color = recv_reduce_color });
+  @initialize_queue(broadcast_send_oq, .{ .color = broadcast_color });
+  @initialize_queue(broadcast_recv_iq, .{ .color = recv_broadcast_color });
+  @initialize_queue(send_y1_oq,        .{ .color = send_y1_color });
+
+  @export_symbol(A_ptr, "A");
+  @export_symbol(x_ptr, "x");
+  @export_symbol(y_ptr, "y");
+  @export_symbol(tsc_start_ptr, "tsc_start");
+  @export_symbol(tsc_end_ptr, "tsc_end");
+  @export_symbol(compute);
+}
