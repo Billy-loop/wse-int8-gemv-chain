@@ -2,17 +2,18 @@
 
 When a computation is laid out spatially on the Cerebras WSE-3, each operator
 runs on its own block of processing elements (PEs), and the activation that one
-operator produces travels over the on-chip fabric to the next. This repository
-asks whether that activation can travel as int8 instead of fp16, and whether
-that pays off. The testbed is a chain of two matrix-vector products written in
-CSL:
+operator produces travels over the on-chip fabric to the next. On GPU clusters,
+compressing such traffic is a standard trick. This repository asks whether it
+pays off here: can that activation travel as int8 instead of fp16 and save
+time? The testbed is a chain of two matrix-vector products, written in CSL and
+run on the Cerebras SDK's simulator of the WSE-3 rather than on hardware:
 
 ```text
 y1 = A1 @ x     gemv1, on one block of PEs
 y2 = A2 @ y1    gemv2, on the next block; y1 crosses over as int8
 ```
 
-**Short answer for this testbed:** int8 cuts the y1 transfer from 63 to 39
+**Short answer from the simulator:** int8 cuts the y1 transfer from 63 to 39
 cycles (N = 512, 8 x 8 PEs per GEMV), but quantizing y1 costs about 1,300
 cycles on the critical path, so the chain runs 17% slower than with fp16. What
 decides the outcome is the cost of quantizing on the PE, not the fabric. See
@@ -20,18 +21,22 @@ decides the outcome is the cost of quantizing on the PE, not the fabric. See
 
 ## Motivation
 
-The WSE-3 is a grid of PEs. Each PE has its own small SRAM, and PEs exchange
-data over a 2D mesh fabric in 32-bit wavelets. The fabric's bandwidth is very
-high, but communication is not free. An operator too large for one PE is spread
-over a rectangle of PEs: its input is broadcast across the rectangle, its
-partial results are reduced, and its output is delivered to the PEs of the next
-operator. This traffic grows with the operator, and the premise of this project
-is that for large enough operators it stops being negligible next to compute.
+On GPU clusters, the links between devices are much slower than the devices'
+compute, so communication is often the bottleneck. Spending a little compute to
+quantize gradients or activations before sending them is a common way to buy
+back bandwidth.
 
-Inside an operator, the partial sums of a reduction change at every hop, so
-compressing them means re-quantizing on every PE. Between operators, the
-payload is an activation vector that is produced once and read by many PEs.
-That makes it a natural candidate for compression: quantize it once where it is
+The WSE-3 is built the other way round. The whole wafer is one chip: a grid of
+PEs, each with its own small SRAM, joined by a 2D mesh fabric of 32-bit links
+between neighbours. An operator too large for one PE is spread over a rectangle
+of PEs, and its output travels over the fabric to the PEs of the next operator.
+Does the GPU intuition carry over to a fabric like this, where the links sit
+right next to the compute?
+
+Between operators is the most favourable place to try it. Inside an operator,
+the partial sums of a reduction change at every hop, so compressing them means
+re-quantizing on every PE. Between operators, the payload is an activation
+vector that is produced once and read by many PEs: quantize it once where it is
 produced, send fewer wavelets, and let the consumers compute on the compressed
 values.
 
@@ -96,10 +101,10 @@ fp16 instead of 12–25%.
 
 ## Results
 
-Every number below was measured with this repository on the simulator
-(`sdk-cbcore-2.10.0`): `scripts/wse3.sh` with `int8` or `fp16` and `M`, `N` set
-to each size, 8 x 8 PEs per GEMV (a 16 x 8 rectangle). Each y1 chunk holds
-`N/8` values.
+Every number below comes from running this repository on the SDK simulator
+(`sdk-cbcore-2.10.0`), not on WSE-3 hardware: `scripts/wse3.sh` with `int8` or
+`fp16` and `M`, `N` set to each size, 8 x 8 PEs per GEMV (a 16 x 8 rectangle).
+Each y1 chunk holds `N/8` values.
 
 ### End to end
 
@@ -155,14 +160,21 @@ calibrated cost for the probe prints themselves; see
    0.6–1.4% of the total, and its share falls as N grows: with the grid fixed
    at 8 x 8, the gemv work per PE grows faster than the y1 chunk. Between two
    adjacent operators at these sizes, the fabric is not the bottleneck.
-3. **Quantizing costs far more than it saves.** It takes about 20 cycles per y1
-   value (18–23), 45–58 times what it saves on the transfer, and it sits on the
-   critical path: gemv2 cannot start before the packet arrives.
-4. **The overhead is the quantize stage.** gemv2 computing on the int8 codes is
+3. **Computing costs far more than moving.** A link carries about one wavelet
+   per cycle (each transfer takes its length in wavelets plus a fixed 22–31
+   cycles), so int8 saves at most about 0.25 cycles per value. Quantizing takes
+   about 20 cycles per value (18–23), 45–58 times what it saves, and it sits on
+   the critical path: gemv2 cannot start before the packet arrives.
+4. **The saving does not add up across receivers.** The fabric forwards each
+   wavelet while delivering it: one hop of the x broadcast adds about 2 cycles
+   (measured with `tools/parse_breakdown.py` at N = 512), not another packet
+   length. A shorter packet saves its length once, not once for each of the
+   eight gemv2 PEs that receive it.
+5. **The overhead is the quantize stage.** gemv2 computing on the int8 codes is
    no slower than on fp16 input, and the end-to-end gap (705, 1,189 and 2,100
    cycles at N = 256, 512 and 1024) is within 10 cycles of the quantize stage
    minus the savings in the transfer and in gemv2.
-5. **The overhead falls with size,** from +25% at N = 128 to +12% at
+6. **The overhead falls with size,** from +25% at N = 128 to +12% at
    N = 1024, because the gemv work grows faster than the quantization does.
 
 Side finding: unrolling the column loop in `gemv()` by four cut the gemv
@@ -190,23 +202,25 @@ than fp16.
 
 ## Open questions
 
-The measurements point at the quantizer, not the fabric. For an int8 link to
-pay off, quantizing has to get much cheaper, or the link has to cost much more
-than one hop between neighbours.
+The measurements point at the quantizer, not the fabric: on an idle link, the
+fabric moves data far more cheaply than a PE can compress it.
 
-- **Cheaper quantization.** About 20 cycles per value is the number to beat.
-  Options include a scale known in advance instead of a per-chunk absmax, a
-  cheaper quantize-and-pack, or another 8-bit format.
+- **Cheaper quantization.** It costs about 20 cycles per value now; to break
+  even on an idle link it would have to cost less than about 0.25. Options
+  include a scale known in advance instead of a per-chunk absmax, a cheaper
+  quantize-and-pack, or another 8-bit format.
 - **Quantization off the critical path.** The per-chunk absmax needs the whole
   reduced chunk before quantizing can start. Smaller sub-chunks with their own
   scales, or a scale known in advance, would let quantizing and sending overlap
   with the y1 reduction.
-- **Links that cost more.** The premise in [Motivation](#motivation) does not
-  show up in these runs: the grid stays at 8 x 8 and the two operators sit next
-  to each other, so the link is short and a larger N only adds compute per PE.
-  Still to measure: growing the grid with N (a fixed block per PE), operators
-  placed far apart, links shared by several transfers, and longer operator
-  chains.
+- **Where bandwidth is actually scarce.** Distance and a bigger grid add
+  latency (more hops), which int8 does not shorten. Only links that several
+  flows compete for (many-to-one, all-to-all) multiply the saving, and data
+  leaving the wafer crosses links far slower than the fabric. Neither is
+  measured here.
+- **Capacity, not bandwidth.** int8 halves the SRAM an activation or a weight
+  takes on a PE, which may be the better reason to quantize on a chip whose PEs
+  have small local memories.
 - **Accuracy.** How far `y2` moves from an unquantized fp16 evaluation has not
   been characterized.
 
@@ -380,8 +394,8 @@ measuring total kernel cycles.
   settings) and `simfab_traces/` into the working directory. `simfab_traces/` is
   about 2 GB after the 512 run and grows with the problem size; delete it when
   you no longer need it. Build and simulator outputs are git-ignored.
-- `host/run.py` accepts `--cmaddr <IP:port>` to run on a CS system. The results
-  above come from the simulator only.
+- `host/run.py` accepts `--cmaddr <IP:port>` to run on a CS system. Every result
+  in this README comes from the simulator; none has been checked on hardware yet.
 
 ## Acknowledgements
 
