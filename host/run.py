@@ -16,8 +16,8 @@
 # limitations under the License.
 #
 # Derived from Cerebras csl-examples tutorials/gemv-08-routes-3, modified to
-# drive the two-GEMV chain, check y2 against a quantization-aware reference,
-# and report on-chip kernel cycles.
+# drive the two-GEMV chain, check y2 against a reference for the chosen y1
+# handoff format, and report on-chip kernel cycles.
 
 import argparse
 import json
@@ -26,7 +26,9 @@ import numpy as np
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime, MemcpyDataType, MemcpyOrder # pylint: disable=no-name-in-module
 from cerebras.sdk.sdk_utils import memcpy_view
 
-from fp16_chain_utils import compute_two_gemv_reference_int8_y1_only, prepare_A_fp16_per_pe
+from fp16_chain_utils import (compute_two_gemv_reference,
+                              compute_two_gemv_reference_int8_y1_only,
+                              prepare_A_fp16_per_pe)
 from timing_utils import summarize_timestamps
 
 # Read arguments
@@ -46,6 +48,9 @@ M = int(compile_data['params']['M']) # rows
 # PE grid dimensions
 kernel_x_dim = int(compile_data['params']['kernel_x_dim'])
 kernel_y_dim = int(compile_data['params']['kernel_y_dim'])
+
+# y1 handoff format: 8 = int8 link, 16 = fp16 baseline
+y1_bits = int(compile_data['params']['y1_bits'])
 
 np.random.seed(seed=7)
 
@@ -76,8 +81,12 @@ A2_packed_raw, A2_words = prepare_A_fp16_per_pe(
 A2_packed = A2_packed_raw.reshape(kernel_x_dim, kernel_y_dim, A2_words)\
                          .transpose(1, 0, 2).ravel().astype(np.uint32)
 
-y1_expected, y2_expected = compute_two_gemv_reference_int8_y1_only(
-    A1, A2, x, kernel_x_dim, kernel_y_dim)
+if y1_bits == 8:
+  y1_expected, y2_expected = compute_two_gemv_reference_int8_y1_only(
+      A1, A2, x, kernel_x_dim, kernel_y_dim)
+else:
+  y1_expected, y2_expected = compute_two_gemv_reference(
+      A1, A2, x, kernel_x_dim, kernel_y_dim)
 y2_original = (A2 @ (A1 @ x).astype(np.float16)).astype(np.float16)
 
 runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
@@ -153,6 +162,7 @@ runner.stop()
 timing = summarize_timestamps(start_ts, end_ts, kernel_x_dim, clock_mhz=850.0)
 assert timing["total_kernel_cycles"] >= timing["per_pe_max"], \
     "total kernel cycles must be at least the slowest single-PE duration"
+print(f"y1 handoff: {'int8' if y1_bits == 8 else 'fp16'}")
 print("=== total on-chip kernel cycles (excludes H2D/D2H) ===")
 print(f"total kernel cycles : {timing['total_kernel_cycles']} cycles "
       f"({timing['total_kernel_time_us']:.3f} us @ 850 MHz)")

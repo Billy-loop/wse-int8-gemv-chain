@@ -106,8 +106,8 @@ def breakdown(tile, ev, prints, cal_list):
     print(f"  receive               : {span(START, GEMV_IN):8.0f} cyc{src}")
     # compute = GEMV_in(5) -> RED_in(8): the @fmach loop + @activate + dispatch
     # into reduce(). On gemv1 the only print inside [5, 8) is GEMV_in itself; on
-    # gemv2 there are three (5/6/7, one pc each via bisect), and the interval
-    # also covers the int8 accumulate + @fmulh dequant.
+    # gemv2 with the int8 link there are three (5/6/7, one pc each via bisect),
+    # and the interval also covers the int8 accumulate + @fmulh dequant.
     print(f"  compute (gemv->reduce): {span(GEMV_IN, RED_IN):8.0f} cyc")
     # Dequant exists only on gemv2 (@fmulh multiplies the scale back in); it is a
     # sub-item of the compute interval above.
@@ -115,13 +115,15 @@ def breakdown(tile, ev, prints, cal_list):
     if deq is not None:
         print(f"    of which dequant    : {deq:8.0f} cyc   (@fmulh, DEQ_in->DEQ_out)")
 
-    if PACKY_IN in ev:  # gemv1 reduce-end PE: quantizes y1 and sends it east
+    if PACKY_IN in ev:  # gemv1 reduce-end PE: sends y1 east (quantizes it first on the int8 link)
         print(f"  E reduce              : {span(RED_IN, PACKY_IN):8.0f} cyc")
-        print(f"  quant y1: absmax/scale: {span(PACKY_IN, PACKY_MID):8.0f} cyc")
-        print(f"    of which @fabsh     : {span(PACKY_IN, PACKY_fabsh):8.0f} cyc")
-        print(f"    of which max fold   : {span(PACKY_fabsh, PACKY_abmax):8.0f} cyc")
-        print(f"  quant y1: quant+pack  : {span(PACKY_MID, PACKY_OUT):8.0f} cyc")
-        print(f"  send to east (@mov32) : {span(PACKY_OUT, END):8.0f} cyc")
+        if PACKY_MID in ev:  # int8 link only
+            print(f"  quantize y1           : {span(PACKY_IN, PACKY_OUT):8.0f} cyc")
+            print(f"    absmax/scale        : {span(PACKY_IN, PACKY_MID):8.0f} cyc")
+            print(f"      of which @fabsh   : {span(PACKY_IN, PACKY_fabsh):8.0f} cyc")
+            print(f"      of which max fold : {span(PACKY_fabsh, PACKY_abmax):8.0f} cyc")
+            print(f"    quant+pack          : {span(PACKY_MID, PACKY_OUT):8.0f} cyc")
+        print(f"  send to east          : {span(PACKY_OUT, END):8.0f} cyc")
     else:  # gemv2 reduce-start PE: @fmovh sends the y2 partial south
         print(f"  send y2 (N-S reduce)  : {span(RED_IN, END):8.0f} cyc")
     # The total span is a raw difference of absolute stamps; no print cost removed.
@@ -154,7 +156,7 @@ def main():
         print("\n=== inter-PE y1 packet propagation (gemv1 -> gemv2) ===")
         print(f"  gemv1 pack done -> gemv2 received all y1: {prop:8.0f} cyc")
         print(f"    (gemv2.GEMV_in {recvd} - gemv1.PACKY_out {ready} - 1 print {pc0:.0f}); "
-              f"int8 packet = ceil(M/4)+1 wavelets")
+              f"int8: ceil(M/4)+1 wavelets, fp16: M/2")
 
     if 1 in col and 2 in col:
         print("\n=== gemv1 x-broadcast per-hop (NS, rightmost col) ===")
@@ -190,6 +192,8 @@ if __name__ == "__main__":
 #       0,1,1,1, 5, 8, 9, 15, 16, 10, 11, 12   (the gemv1 path emits no 6/7)
 #   tile 1 (gemv2, top-left = reduce start):
 #       0,1,1,1, 5, 6, 7, 8, 12                (6 = dequant-in, 7 = dequant-out)
+#   with the fp16 link (y1_bits = 16) there is nothing to quantize or dequantize:
+#       tile 0: 0,1,1,1, 5, 8, 9, 11, 12       tile 1: 0,1,1,1, 5, 8, 12
 #
 # both tiles:
 #   receive             = span(START(0), GEMV_in(5))   [drops START + 3 CAL = 4 pc]
@@ -202,6 +206,7 @@ if __name__ == "__main__":
 #   send y2 (N-S)       = span(RED_in(8), END(12))     [drops 1 pc]
 # gemv1 only (reduce end):
 #   E reduce            = span(RED_in(8), PACKY_in(9))       [drops 1 pc]
+#   quantize y1         = span(PACKY_in(9), PACKY_out(11))   [drops 4 pc: 9, 15, 16, 10]
 #   quant y1 absmax     = span(PACKY_in(9), PACKY_mid(10))   [drops 3 pc: 9, 15, 16]
 #     of which @fabsh   = span(PACKY_in(9), fabsh(15))       [drops 1 pc]
 #     of which max fold = span(fabsh(15), abmax(16))         [drops 1 pc]

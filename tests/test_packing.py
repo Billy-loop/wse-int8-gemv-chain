@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Verifies the two layers of fp16 packing the kernel relies on:
+Verifies the packing the kernel relies on:
 
 1. **Host-side u32 packing.** Each pair of consecutive f16s is reinterpreted
    as a single u32 (low 16 bits = first f16, high 16 bits = second) via
@@ -16,6 +16,11 @@ Verifies the two layers of fp16 packing the kernel relies on:
    each through the simulator at a problem size large enough to make the
    y-reduce traffic measurable, and parses `num_wavelets` out of sim.log
    to confirm the simd_max path emits strictly fewer wavelets.
+
+3. **The y1 link format.** The int8 build (`y1_bits:8`) sends each y1 chunk
+   of n values as ceil(n/4) + 1 wavelets, the fp16 baseline (`y1_bits:16`) as
+   n/2. The test builds both and checks that the int8 build puts fewer
+   wavelets on the fabric.
 
 Run from the project root with the host python (the orchestration uses
 only stdlib; cs_python is invoked as a subprocess for the numpy bits and
@@ -40,7 +45,8 @@ SIM_STATS = REPO / "sim_stats.json"
 
 # A square two-GEMV smoke problem big enough that fp16 reduce wavelets are
 # measurable while still quick in the simulator.
-PARAMS = "kernel_x_dim:4,kernel_y_dim:4,M:64,N:64"
+BASE_PARAMS = "kernel_x_dim:4,kernel_y_dim:4,M:64,N:64"
+PARAMS = f"{BASE_PARAMS},y1_bits:8"
 KX, KY = 4, 4
 M, N = 64, 64
 M_PER_PE = M // KY  # gemv1 reduce vector length; gemv2 matches when kx == ky.
@@ -99,7 +105,7 @@ def test_host_packing_roundtrip():
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
         raise RuntimeError("host-side packing round-trip failed inside cs_python")
-    print("[1/2] host packing  : OK")
+    print("[1/3] host packing  : OK")
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +128,12 @@ def patch_simd_mode(mode: str):
     return prev
 
 
-def build_and_run() -> tuple[int, int]:
+def build_and_run(params: str = PARAMS) -> tuple[int, int]:
     """Compile + run the kernel; returns (num_wavelets, cycle_count)."""
     subprocess.run(
         ["cslc", "--arch=wse3", "csl/layout.csl",
          "--fabric-dims=15,6", "--fabric-offsets=4,1",
-         f"--params={PARAMS}",
+         f"--params={params}",
          "-o", "out", "--memcpy", "--channels", "1"],
         cwd=REPO, check=True, capture_output=True,
     )
@@ -183,7 +189,35 @@ def test_simd_reduces_wavelets():
         f"savings {saved} is far below expected minimum {expected_min} "
         f"for M_per_PE={M_PER_PE}, kx={KX}, ky={KY}.")
 
-    print("[2/2] fabric SIMD   : OK")
+    print("[2/3] fabric SIMD   : OK")
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — y1 link format (int8 build vs fp16 baseline)
+# ---------------------------------------------------------------------------
+
+def test_int8_link_sends_fewer_wavelets():
+    print("      compiling/running the fp16 baseline (y1_bits:16) ...")
+    w_fp16, c_fp16 = build_and_run(f"{BASE_PARAMS},y1_bits:16")
+    print(f"        wavelets={w_fp16}  cycles={c_fp16}")
+
+    print("      compiling/running the int8 link (y1_bits:8) ...")
+    w_int8, c_int8 = build_and_run(f"{BASE_PARAMS},y1_bits:8")
+    print(f"        wavelets={w_int8}  cycles={c_int8}")
+
+    # Each of the KY y1 chunks (M_PER_PE values) shrinks from M_PER_PE/2 fp16
+    # wavelets to a scale word plus ceil(M_PER_PE/4) code words and crosses at
+    # least one link; everything else on the fabric is the same in both builds.
+    fp16_words = M_PER_PE // 2
+    int8_words = (M_PER_PE + 3) // 4 + 1
+    expected_min = (fp16_words - int8_words) * KY
+    saved = w_fp16 - w_int8
+    print(f"      int8 link saves {saved} wavelets (expected at least {expected_min})")
+    assert saved >= expected_min, (
+        f"the int8 build should send at least {expected_min} fewer wavelets "
+        f"than the fp16 build, got {w_int8=} {w_fp16=}.")
+
+    print("[3/3] y1 link format: OK")
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +225,7 @@ def test_simd_reduces_wavelets():
 def main():
     test_host_packing_roundtrip()
     test_simd_reduces_wavelets()
+    test_int8_link_sends_fewer_wavelets()
     print("\nall packing tests passed.")
 
 

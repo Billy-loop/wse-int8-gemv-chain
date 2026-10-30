@@ -14,8 +14,8 @@
 // limitations under the License.
 //
 // Derived from Cerebras csl-examples tutorials/gemv-08-routes-3, modified to
-// run both GEMV tiles, quantize the y1 handoff to int8, and record on-chip TSC
-// timestamps.
+// run both GEMV tiles, send the y1 handoff as int8 or fp16, and record on-chip
+// TSC timestamps.
 
 param memcpy_params;
 
@@ -29,6 +29,12 @@ param kernel_y_dim: u16;
 
 // Tile kind: 0 = gemv1 (broadcast NS, reduce EW), 1 = gemv2 (broadcast EW, reduce NS)
 param tile_kind: u16;
+
+// y1 handoff format: 8 = int8 packet, 16 = fp16 baseline (see layout.csl).
+param y1_bits: i16;
+const Y1_INT8: bool = y1_bits == 8;
+// Only gemv2 with the int8 link drains an int8 packet; every other PE drains fp16.
+const RECV_INT8: bool = tile_kind == 1 and Y1_INT8;
 
 // --- Fabric colors ---------------------------------------------------------
 param send_reduce_color:     color; // sends partial y along the reduce axis (fp16)
@@ -93,11 +99,12 @@ const act_packet_word = packed union {
   raw: u32,
 };
 
+// Drained fp16 activation: x on gemv1, y1 on gemv2 in the fp16 baseline.
 var x_recv: [N_per_PE]f16;
 
-// gemv2 drains its int8 y1 packet here, then dequantizes in gemv().
+// int8 link only: gemv2 drains its y1 packet here, then dequantizes in gemv().
 var act_recv_buf: [RECV_PACKET_WORDS]u32;
-// gemv1 reduce-end PE quantizes its final y1 chunk here before the east handoff.
+// int8 link only: the gemv1 reduce-end PE quantizes its final y1 chunk here.
 var y1_send_buf: [Y1_PACKET_WORDS]u32;
 
 const x_recv_dsd      = @get_dsd(mem1d_dsd, .{ .base_address = &x_recv,      .extent = N_per_PE });
@@ -310,8 +317,9 @@ fn compute() void {
   probe_mark(1);
   probe_mark(1);
 
-  if (tile_kind == 0) {
-    // gemv1: fp16 x, bulk @fmovh with simd_max (two f16 per 32-bit wavelet).
+  if (!RECV_INT8) {
+    // fp16 activation (x on gemv1, y1 on gemv2 in the fp16 baseline): bulk
+    // @fmovh with simd_max (two f16 per 32-bit wavelet).
     const recv_dsd = @get_dsd(fabin_dsd, .{
       .extent = N_per_PE,
       .input_queue = broadcast_recv_iq,
@@ -349,8 +357,8 @@ task gemv() void {
   probe_mark(5); // GEMV_in: slice drained, accumulate begins
   col_mark();    // x-arrival on gemv1 rightmost-col rows 1,2 (per-hop NS latency)
   mid_mark(0);   // interior PE (kx-2,1) recv: data in, work begins
-  if (tile_kind == 0) {
-
+  if (!RECV_INT8) {
+    // fp16 activation in x_recv: gemv1, or gemv2 in the fp16 baseline.
     var j: i16 = 0;
     while (j + 4 <= N_per_PE) {
       @fmach(y_dsd, y_dsd, A_dsd, x_recv[j + 0]);
@@ -456,13 +464,24 @@ task after_reduce() void {
 
 task send_y1() void {
   probe_mark(9); // PACKY_in: E reduce done, quant+pack y1 begins
-  pack_y1_packet();
-  probe_mark(11); // PACKY_out: quant+pack y1 done, handoff @mov32 begins
-  const send_dsd = @get_dsd(fabout_dsd, .{
-    .extent = Y1_PACKET_WORDS,
-    .output_queue = send_y1_oq,
-  });
-  @mov32(send_dsd, y1_send_buf_dsd, .{ .async = true, .activate = stamp_and_exit_task_id });
+  if (Y1_INT8) {
+    pack_y1_packet();
+    probe_mark(11); // PACKY_out: quant+pack y1 done, handoff @mov32 begins
+    const send_dsd = @get_dsd(fabout_dsd, .{
+      .extent = Y1_PACKET_WORDS,
+      .output_queue = send_y1_oq,
+    });
+    @mov32(send_dsd, y1_send_buf_dsd, .{ .async = true, .activate = stamp_and_exit_task_id });
+  } else {
+    // fp16 baseline: send the y1 chunk as is, two f16 per wavelet.
+    probe_mark(11); // PACKY_out: handoff begins (nothing to pack)
+    const send_dsd = @get_dsd(fabout_dsd, .{
+      .extent = M_per_PE,
+      .output_queue = send_y1_oq,
+      .simd_mode = .{ .simd_max = true },
+    });
+    @fmovh(send_dsd, y_dsd, .{ .async = true, .activate = stamp_and_exit_task_id });
+  }
 }
 
 

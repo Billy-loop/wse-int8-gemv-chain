@@ -14,8 +14,8 @@
 // limitations under the License.
 //
 // Derived from Cerebras csl-examples tutorials/gemv-08-routes-3, modified to
-// lay out a two-tile GEMV chain (gemv1 | gemv2) with an int8 y1 handoff
-// between the tiles.
+// lay out a two-tile GEMV chain (gemv1 | gemv2) with an int8 or fp16 y1
+// handoff between the tiles.
 
 // kernel dimensions
 param kernel_x_dim: i16;
@@ -24,6 +24,10 @@ param kernel_y_dim: i16;
 // total matrix dimensions
 param M: i16;
 param N: i16;
+
+// y1 handoff format: 8 = int8 packet (one scale word + four codes per word),
+// 16 = fp16 baseline (two values per wavelet).
+param y1_bits: i16;
 
 // gemv1 (left tile) colors
 const x_color:     color = @get_color(0);
@@ -49,6 +53,7 @@ layout {
   @comptime_assert(M == N);
   @comptime_assert(M % kernel_y_dim == 0);
   @comptime_assert(N % kernel_x_dim == 0);
+  @comptime_assert(y1_bits == 8 or y1_bits == 16);
 
   for (@range(i16, 2 * kernel_x_dim)) |gx| {
     for (@range(i16, kernel_y_dim)) |pe_y| {
@@ -75,6 +80,7 @@ layout {
           .kernel_x_dim = kernel_x_dim,
           .kernel_y_dim = kernel_y_dim,
           .tile_kind = tile_kind,
+          .y1_bits = y1_bits,
           .broadcast_color = bcast_send,
           .recv_broadcast_color = bcast_recv,
           .send_y1_color = y1_color,
@@ -89,6 +95,7 @@ layout {
           .kernel_x_dim = kernel_x_dim,
           .kernel_y_dim = kernel_y_dim,
           .tile_kind = tile_kind,
+          .y1_bits = y1_bits,
           .broadcast_color = bcast_send,
           .recv_broadcast_color = bcast_recv,
           .send_y1_color = y1_color,
